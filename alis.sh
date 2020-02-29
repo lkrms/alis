@@ -35,7 +35,7 @@ set -e
 
 # Usage:
 # # loadkeys es
-# # curl https://raw.githubusercontent.com/picodotdev/alis/master/download.sh | bash, or with URL shortener curl -sL https://bit.ly/2F3CATp | bash
+# # curl https://raw.githubusercontent.com/lkrms/alis/master/download.sh | bash
 # # vim alis.conf
 # # ./alis.sh
 
