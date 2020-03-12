@@ -966,7 +966,15 @@ function desktop_environment_kde() {
 }
 
 function desktop_environment_xfce() {
-    pacman_install "xfce4 xfce4-goodies lightdm lightdm-gtk-greeter xorg-server"
+    pacman_install "xfce4 $(arch-chroot /mnt pacman -Sygq xfce4-goodies | grep -Fxv "xfce4-screensaver" | xargs) lightdm lightdm-gtk-greeter xorg-server xsecurelock xss-lock"
+    mkdir -p /mnt/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml &&
+        echo '<?xml version="1.0" encoding="UTF-8"?>
+
+<channel name="xfce4-session" version="1.0">
+  <property name="general" type="empty">
+    <property name="LockCommand" type="string" value="env XSECURELOCK_SAVER=saver_blank xsecurelock"/>
+  </property>
+</channel>' >/mnt/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml
     arch-chroot /mnt systemctl enable lightdm.service
 }
 
@@ -1130,12 +1138,12 @@ function main() {
     if [ "$VIRTUALBOX" == "true" ]; then
         virtualbox
     fi
-    users
     mkinitcpio
     bootloader
     if [ "$DESKTOP_ENVIRONMENT" != "" ]; then
         desktop_environment
     fi
+    users
     packages
     terminate
     end
