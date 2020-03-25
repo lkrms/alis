@@ -35,7 +35,7 @@ set -e
 
 # Usage:
 # # loadkeys es
-# # curl https://raw.githubusercontent.com/lkrms/alis/master/download.sh | bash
+# # curl -L https://lkr.ms/alis | bash
 # # vim alis.conf
 # # ./alis.sh
 
@@ -50,6 +50,7 @@ LVM_DEVICE=""
 LVM_VOLUME_PHISICAL="lvm"
 LVM_VOLUME_GROUP="vg"
 LVM_VOLUME_LOGICAL="root"
+SWAPFILE=""
 BOOT_DIRECTORY=""
 ESP_DIRECTORY=""
 #PARTITION_BOOT_NUMBER=0
@@ -60,7 +61,7 @@ PARTUUID_ROOT=""
 DEVICE_SATA=""
 DEVICE_NVME=""
 DEVICE_MMC=""
-CPU_INTEL=""
+CPU_VENDOR=""
 VIRTUALBOX=""
 CMDLINE_LINUX_ROOT=""
 CMDLINE_LINUX=""
@@ -84,6 +85,10 @@ function configuration_install() {
 
 function sanitize_variables() {
     DEVICE=$(sanitize_variable "$DEVICE")
+    PARTITION_MODE=$(sanitize_variable "$PARTITION_MODE")
+    PARTITION_BIOS=$(sanitize_variable "$PARTITION_BIOS")
+    PARTITION_BOOT=$(sanitize_variable "$PARTITION_BOOT")
+    PARTITION_ROOT=$(sanitize_variable "$PARTITION_ROOT")
     FILE_SYSTEM_TYPE=$(sanitize_variable "$FILE_SYSTEM_TYPE")
     SWAP_SIZE=$(sanitize_variable "$SWAP_SIZE")
     KERNELS=$(sanitize_variable "$KERNELS")
@@ -112,13 +117,23 @@ function check_variables() {
     check_variables_value "DEVICE" "$DEVICE"
     check_variables_boolean "LVM" "$LVM"
     check_variables_equals "PARTITION_ROOT_ENCRYPTION_PASSWORD" "PARTITION_ROOT_ENCRYPTION_PASSWORD_RETYPE" "$PARTITION_ROOT_ENCRYPTION_PASSWORD" "$PARTITION_ROOT_ENCRYPTION_PASSWORD_RETYPE"
+    check_variables_list "PARTITION_MODE" "$PARTITION_MODE" "auto custom manual" "true"
+    check_variables_value "PARTITION_CUSTOM_PARTED_UEFI" "$PARTITION_CUSTOM_PARTED_UEFI"
+    check_variables_value "PARTITION_CUSTOM_PARTED_BIOS" "$PARTITION_CUSTOM_PARTED_BIOS"
+    check_variables_value "PARTITION_BIOS" "$PARTITION_BIOS"
+    check_variables_value "PARTITION_BOOT" "$PARTITION_BOOT"
+    check_variables_value "PARTITION_ROOT" "$PARTITION_ROOT"
+    if [ "$LVM" == "true" ]; then
+        check_variables_list "PARTITION_MODE" "$PARTITION_MODE" "auto" "true"
+    fi
     check_variables_list "FILE_SYSTEM_TYPE" "$FILE_SYSTEM_TYPE" "ext4 btrfs xfs"
     check_variables_value "PING_HOSTNAME" "$PING_HOSTNAME"
     check_variables_value "PACMAN_MIRROR" "$PACMAN_MIRROR"
     check_variables_list "KERNELS" "$KERNELS" "linux-lts linux-lts-headers linux-hardened linux-hardened-headers linux-zen linux-zen-headers" "false"
     check_variables_list "KERNELS_COMPRESSION" "$KERNELS_COMPRESSION" "gzip bzip2 lzma xz lzop lz4" "false"
     check_variables_value "TIMEZONE" "$TIMEZONE"
-    check_variables_value "LOCALE" "$LOCALE"
+    check_variables_value "LOCALES" "$LOCALES"
+    check_variables_value "LOCALE_CONF" "$LOCALE_CONF"
     check_variables_value "LANG" "$LANG"
     check_variables_value "KEYMAP" "$KEYMAP"
     check_variables_value "HOSTNAME" "$HOSTNAME"
@@ -126,7 +141,7 @@ function check_variables() {
     check_variables_value "USER_PASSWORD" "$USER_PASSWORD"
     check_variables_equals "ROOT_PASSWORD" "ROOT_PASSWORD_RETYPE" "$ROOT_PASSWORD" "$ROOT_PASSWORD_RETYPE"
     check_variables_equals "USER_PASSWORD" "USER_PASSWORD_RETYPE" "$USER_PASSWORD" "$USER_PASSWORD_RETYPE"
-    check_variables_size "ADDITIONAL_USER_PASSWORDS" "${#ADDITIONAL_USER_NAMES_ARRAY[@]}" "${#ADDITIONAL_USER_PASSWORDS_ARRAY[@]}"
+    check_variables_value "HOOKS" "$HOOKS"
     check_variables_list "BOOTLOADER" "$BOOTLOADER" "grub refind systemd"
     check_variables_list "AUR" "$AUR" "aurman yay" "false"
     check_variables_list "DESKTOP_ENVIRONMENT" "$DESKTOP_ENVIRONMENT" "gnome kde xfce mate cinnamon lxde" "false"
@@ -251,7 +266,9 @@ function facts() {
     fi
 
     if [ -n "$(lscpu | grep GenuineIntel)" ]; then
-        CPU_INTEL="true"
+        CPU_VENDOR="intel"
+    elif [ -n "$(lscpu | grep AuthenticAMD)" ]; then
+        CPU_VENDOR="amd"
     fi
 
     if [ -n "$(lspci | grep -i virtualbox)" ]; then
@@ -274,6 +291,8 @@ function prepare() {
     configure_time
     prepare_partition
     configure_network
+
+    pacman -Sy
 }
 
 function configure_time() {
@@ -318,7 +337,8 @@ function configure_network() {
         sleep 10
     fi
 
-    ping -c 5 $PING_HOSTNAME
+    # only on ping -c 1, packer gets stuck if -c 5
+    ping -c 1 -i 2 -W 5 -w 30 $PING_HOSTNAME
     if [ $? -ne 0 ]; then
         echo "Network ping check failed. Cannot continue."
         exit
@@ -328,70 +348,102 @@ function configure_network() {
 function partition() {
     print_step "partition()"
 
-    sgdisk --zap-all $DEVICE
-    wipefs -a $DEVICE
+    # setup
+    PARTITION_PARTED_UEFI="mklabel gpt mkpart primary fat32 1MiB 512MiB mkpart primary $FILE_SYSTEM_TYPE 512MiB 100% set 1 boot on"
+    PARTITION_PARTED_BIOS="mklabel gpt mkpart primary fat32 1MiB 128MiB mkpart primary $FILE_SYSTEM_TYPE 128MiB 512MiB mkpart primary $FILE_SYSTEM_TYPE 512MiB 100% set 1 boot on"
 
-    if [ "$BIOS_TYPE" == "uefi" ]; then
-        if [ "$DEVICE_SATA" == "true" ]; then
-            PARTITION_BOOT="${DEVICE}1"
-            PARTITION_ROOT="${DEVICE}2"
-            #PARTITION_BOOT_NUMBER=1
-            DEVICE_ROOT="${DEVICE}2"
+    if [ "$PARTITION_MODE" == "auto" ]; then
+        if [ "$BIOS_TYPE" == "uefi" ]; then
+            if [ "$DEVICE_SATA" == "true" ]; then
+                PARTITION_BOOT="${DEVICE}1"
+                PARTITION_ROOT="${DEVICE}2"
+                #PARTITION_BOOT_NUMBER=1
+                DEVICE_ROOT="${DEVICE}2"
+            fi
+
+            if [ "$DEVICE_NVME" == "true" ]; then
+                PARTITION_BOOT="${DEVICE}p1"
+                PARTITION_ROOT="${DEVICE}p2"
+                #PARTITION_BOOT_NUMBER=1
+                DEVICE_ROOT="${DEVICE}p2"
+            fi
+
+            if [ "$DEVICE_MMC" == "true" ]; then
+                PARTITION_BOOT="${DEVICE}p1"
+                PARTITION_ROOT="${DEVICE}p2"
+                #PARTITION_BOOT_NUMBER=1
+                DEVICE_ROOT="${DEVICE}p2"
+            fi
         fi
 
-        if [ "$DEVICE_NVME" == "true" ]; then
-            PARTITION_BOOT="${DEVICE}p1"
-            PARTITION_ROOT="${DEVICE}p2"
-            #PARTITION_BOOT_NUMBER=1
-            DEVICE_ROOT="${DEVICE}p2"
+        if [ "$BIOS_TYPE" == "bios" ]; then
+            if [ "$DEVICE_SATA" == "true" ]; then
+                PARTITION_BIOS="${DEVICE}1"
+                PARTITION_BOOT="${DEVICE}2"
+                PARTITION_ROOT="${DEVICE}3"
+                #PARTITION_BOOT_NUMBER=2
+                DEVICE_ROOT="${DEVICE}3"
+            fi
+
+            if [ "$DEVICE_NVME" == "true" ]; then
+                PARTITION_BIOS="${DEVICE}p1"
+                PARTITION_BOOT="${DEVICE}p2"
+                PARTITION_ROOT="${DEVICE}p3"
+                #PARTITION_BOOT_NUMBER=2
+                DEVICE_ROOT="${DEVICE}p3"
+            fi
+
+            if [ "$DEVICE_MMC" == "true" ]; then
+                PARTITION_BIOS="${DEVICE}p1"
+                PARTITION_BOOT="${DEVICE}p2"
+                PARTITION_ROOT="${DEVICE}p3"
+                #PARTITION_BOOT_NUMBER=2
+                DEVICE_ROOT="${DEVICE}p3"
+            fi
         fi
-        
-        if [ "$DEVICE_MMC" == "true" ]; then
-            PARTITION_BOOT="${DEVICE}p1"
-            PARTITION_ROOT="${DEVICE}p2"
-            #PARTITION_BOOT_NUMBER=1
-            DEVICE_ROOT="${DEVICE}p2"
+    elif [ "$PARTITION_MODE" == "custom" ]; then
+        PARTITION_PARTED_UEFI=$PARTITION_CUSTOM_PARTED_UEFI
+        PARTITION_PARTED_BIOS=$PARTITION_CUSTOM_PARTED_BIOS
+        DEVICE_ROOT="${PARTITION_ROOT}"
+    elif [ "$PARTITION_MODE" == "manual" ]; then
+        DEVICE_ROOT="${PARTITION_ROOT}"
+    fi
+
+    # partition
+    if [ "$FILE_SYSTEM_TYPE" == "f2fs" ]; then
+        pacman -S f2fs-tools
+    fi
+
+    if [ "$PARTITION_MODE" == "auto" ]; then
+        sgdisk --zap-all $DEVICE
+        wipefs -a $DEVICE
+    fi
+
+    if [ "$PARTITION_MODE" == "auto" -o "$PARTITION_MODE" == "custom" ]; then
+        if [ "$BIOS_TYPE" == "uefi" ]; then
+            parted -s $DEVICE $PARTITION_PARTED_UEFI
+
+            if [ "$PARTITION_MODE" == "auto" ]; then
+                sgdisk -t=1:ef00 $DEVICE
+                if [ "$LVM" == "true" ]; then
+                    sgdisk -t=2:8e00 $DEVICE
+                fi
+            fi
         fi
 
-        parted -s $DEVICE mklabel gpt mkpart primary fat32 1MiB 512MiB mkpart primary $FILE_SYSTEM_TYPE 512MiB 100% set 1 boot on
-        sgdisk -t=1:ef00 $DEVICE
-        if [ "$LVM" == "true" ]; then
-            sgdisk -t=2:8e00 $DEVICE
+        if [ "$BIOS_TYPE" == "bios" ]; then
+            parted -s $DEVICE $PARTITION_PARTED_BIOS
+
+            if [ "$PARTITION_MODE" == "auto" ]; then
+                sgdisk -t=1:ef02 $DEVICE
+                if [ "$LVM" == "true" ]; then
+                    sgdisk -t=3:8e00 $DEVICE
+                fi
+            fi
         fi
     fi
 
-    if [ "$BIOS_TYPE" == "bios" ]; then
-        if [ "$DEVICE_SATA" == "true" ]; then
-            PARTITION_BIOS="${DEVICE}1"
-            PARTITION_BOOT="${DEVICE}2"
-            PARTITION_ROOT="${DEVICE}3"
-            #PARTITION_BOOT_NUMBER=2
-            DEVICE_ROOT="${DEVICE}3"
-        fi
-
-        if [ "$DEVICE_NVME" == "true" ]; then
-            PARTITION_BIOS="${DEVICE}p1"
-            PARTITION_BOOT="${DEVICE}p2"
-            PARTITION_ROOT="${DEVICE}p3"
-            #PARTITION_BOOT_NUMBER=2
-            DEVICE_ROOT="${DEVICE}p3"
-        fi
-        
-        if [ "$DEVICE_MMC" == "true" ]; then
-            PARTITION_BIOS="${DEVICE}p1"
-            PARTITION_BOOT="${DEVICE}p2"
-            PARTITION_ROOT="${DEVICE}p3"
-            #PARTITION_BOOT_NUMBER=2
-            DEVICE_ROOT="${DEVICE}p3"
-        fi
-
-        parted -s $DEVICE mklabel gpt mkpart primary fat32 1MiB 128MiB mkpart primary $FILE_SYSTEM_TYPE 128MiB 512MiB mkpart primary $FILE_SYSTEM_TYPE 512MiB 100% set 1 boot on
-        sgdisk -t=1:ef02 $DEVICE
-        if [ "$LVM" == "true" ]; then
-            sgdisk -t=3:8e00 $DEVICE
-        fi
-    fi
-
+    # luks and lvm
     if [ -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" ]; then
         LVM_DEVICE="/dev/mapper/$LVM_VOLUME_PHISICAL"
     else
@@ -412,6 +464,7 @@ function partition() {
         DEVICE_ROOT="/dev/mapper/$LVM_VOLUME_GROUP-$LVM_VOLUME_LOGICAL"
     fi
 
+    # format
     if [ "$BIOS_TYPE" == "uefi" ]; then
         wipefs -a $PARTITION_BOOT
         wipefs -a $DEVICE_ROOT
@@ -428,23 +481,46 @@ function partition() {
         mkfs."$FILE_SYSTEM_TYPE" -L root $DEVICE_ROOT
     fi
 
-    PARTITION_OPTIONS=""
+    PARTITION_OPTIONS="defaults"
 
     if [ "$DEVICE_TRIM" == "true" ]; then
-        PARTITION_OPTIONS="defaults,noatime"
+        PARTITION_OPTIONS="$PARTITION_OPTIONS,noatime"
     fi
 
-    mount -o "$PARTITION_OPTIONS" "$DEVICE_ROOT" /mnt
+    # mount
+    if [ "$FILE_SYSTEM_TYPE" == "btrfs" ]; then
+        mount -o "$PARTITION_OPTIONS" "$DEVICE_ROOT" /mnt
+        btrfs subvolume create /mnt/root
+        btrfs subvolume create /mnt/home
+        btrfs subvolume create /mnt/var
+        btrfs subvolume create /mnt/snapshots
+        umount /mnt
 
-    mkdir /mnt/boot
-    mount -o "$PARTITION_OPTIONS" "$PARTITION_BOOT" /mnt/boot
+        mount -o "subvol=root,$PARTITION_OPTIONS,compress=lzo" "$DEVICE_ROOT" /mnt
 
+        mkdir /mnt/{boot,home,var,snapshots}
+        mount -o "$PARTITION_OPTIONS" "$PARTITION_BOOT" /mnt/boot
+        mount -o "subvol=home,$PARTITION_OPTIONS,compress=lzo" "$DEVICE_ROOT" /mnt/home
+        mount -o "subvol=var,$PARTITION_OPTIONS,compress=lzo" "$DEVICE_ROOT" /mnt/var
+        mount -o "subvol=snapshots,$PARTITION_OPTIONS,compress=lzo" "$DEVICE_ROOT" /mnt/snapshots
+    else
+        mount -o "$PARTITION_OPTIONS" "$DEVICE_ROOT" /mnt
+
+        mkdir /mnt/boot
+        mount -o "$PARTITION_OPTIONS" "$PARTITION_BOOT" /mnt/boot
+    fi
+
+    # swap
+    # btrfs: https://btrfs.wiki.kernel.org/index.php/FAQ#Does_btrfs_support_swap_files.3F
+    # btrfs: https://wiki.archlinux.org/index.php/Btrfs#Disabling_CoW
+    # btrfs: https://jlk.fjfi.cvut.cz/arch/manpages/man/btrfs.5#MOUNT_OPTIONS
     if [ -n "$SWAP_SIZE" -a "$FILE_SYSTEM_TYPE" != "btrfs" ]; then
-        fallocate -l $SWAP_SIZE /mnt/swap
-        chmod 600 /mnt/swap
-        mkswap /mnt/swap
+        fallocate -l $SWAP_SIZE "/mnt/swapfile"
+        chmod 600 "/mnt/swapfile"
+        mkswap "/mnt/swapfile"
     fi
 
+    # set variables
     BOOT_DIRECTORY=/boot
     ESP_DIRECTORY=/boot
     UUID_BOOT=$(blkid -s UUID -o value $PARTITION_BOOT)
@@ -468,15 +544,6 @@ function install() {
     sed -i 's/#TotalDownload/TotalDownload/' /mnt/etc/pacman.conf
 }
 
-function kernels() {
-    print_step "kernels()"
-
-    pacman_install "linux-headers"
-    if [ -n "$KERNELS" ]; then
-        pacman_install "$KERNELS"
-    fi
-}
-
 function configuration() {
     print_step "configuration()"
 
@@ -484,7 +551,7 @@ function configuration() {
 
     if [ -n "$SWAP_SIZE" -a "$FILE_SYSTEM_TYPE" != "btrfs" ]; then
         echo "# swap" >> /mnt/etc/fstab
-        echo "/swap none swap defaults 0 0" >> /mnt/etc/fstab
+        echo "/swapfile none swap defaults 0 0" >> /mnt/etc/fstab
         echo "" >> /mnt/etc/fstab
     fi
 
@@ -495,11 +562,30 @@ function configuration() {
 
     arch-chroot /mnt ln -s -f $TIMEZONE /etc/localtime
     arch-chroot /mnt hwclock --systohc
-    sed -i "s/#$LOCALE/$LOCALE/" /mnt/etc/locale.gen
+    for LOCALE in "${LOCALES[@]}"; do
+        sed -i "s/#$LOCALE/$LOCALE/" /etc/locale.gen
+        sed -i "s/#$LOCALE/$LOCALE/" /mnt/etc/locale.gen
+    done
+    locale-gen
     arch-chroot /mnt locale-gen
-    echo -e "$LANG\n$LANGUAGE" > /mnt/etc/locale.conf
+    for VARIABLE in "${LOCALE_CONF[@]}"; do
+        localectl set-locale "$VARIABLE"
+        echo -e "$VARIABLE" >> /mnt/etc/locale.conf
+    done
     echo -e "$KEYMAP\n$FONT\n$FONT_MAP" > /mnt/etc/vconsole.conf
     echo $HOSTNAME > /mnt/etc/hostname
+
+    arch-chroot /mnt mkdir -p "/etc/X11/xorg.conf.d/"
+    cat <<EOT > /mnt/etc/X11/xorg.conf.d/00-keyboard.conf
+# Written by systemd-localed(8), read by systemd-localed and Xorg. It's
+# probably wise not to edit this file manually. Use localectl(1) to
+# instruct systemd-localed to update it.
+Section "InputClass"
+    Identifier "system-keyboard"
+    MatchIsKeyboard "on"
+    Option "XkbLayout" "$KEYLAYOUT"
+EndSection
+EOT
 
     if [ -n "$SWAP_SIZE" ]; then
         echo "vm.swappiness=10" > /mnt/etc/sysctl.d/99-sysctl.conf
@@ -508,25 +594,8 @@ function configuration() {
     printf "$ROOT_PASSWORD\n$ROOT_PASSWORD" | arch-chroot /mnt passwd
 }
 
-function network() {
-    print_step "network()"
-
-    pacman_install "networkmanager"
-    arch-chroot /mnt systemctl enable NetworkManager.service
-}
-
-function virtualbox() {
-    print_step "virtualbox()"
-
-    if [ -z "$KERNELS" ]; then
-        pacman_install "virtualbox-guest-utils virtualbox-guest-modules-arch"
-    else
-        pacman_install "virtualbox-guest-utils virtualbox-guest-dkms"
-    fi
-}
-
-function mkinitcpio() {
-    print_step "mkinitcpio()"
+function mkinitcpio_configuration() {
+    print_step "mkinitcpio_configuration()"
 
     if [ "$KMS" == "true" ]; then
         MODULES=""
@@ -547,28 +616,78 @@ function mkinitcpio() {
                 MODULES="nouveau"
                 ;;
         esac
-        arch-chroot /mnt sed -i "s/MODULES=()/MODULES=($MODULES)/" /etc/mkinitcpio.conf
+        arch-chroot /mnt sed -i "s/^MODULES=()/MODULES=($MODULES)/" /etc/mkinitcpio.conf
     fi
 
     if [ "$LVM" == "true" ]; then
         pacman_install "lvm2"
     fi
-
-    if [ "$LVM" == "true" -a -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" ]; then
-        arch-chroot /mnt sed -i 's/ block / block keyboard keymap /' /etc/mkinitcpio.conf
-        arch-chroot /mnt sed -i 's/ filesystems keyboard / encrypt lvm2 filesystems /' /etc/mkinitcpio.conf
-    elif [ "$LVM" == "true" ]; then
-        arch-chroot /mnt sed -i 's/ filesystems / lvm2 filesystems /' /etc/mkinitcpio.conf
-    elif [ -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" ]; then
-        arch-chroot /mnt sed -i 's/ block / block keyboard keymap /' /etc/mkinitcpio.conf
-        arch-chroot /mnt sed -i 's/ filesystems keyboard / encrypt filesystems /' /etc/mkinitcpio.conf
+    if [ "$FILE_SYSTEM_TYPE" == "btrfs" ]; then
+        pacman_install "btrfs-progs"
     fi
+    if [ "$FILE_SYSTEM_TYPE" == "f2fs" ]; then
+        pacman_install "f2fs-tools"
+    fi
+
+    if [ "$BOOTLOADER" == "systemd" ]; then
+        HOOKS=$(echo $HOOKS | sed 's/!systemd/systemd/')
+        HOOKS=$(echo $HOOKS | sed 's/!sd-vconsole/sd-vconsole/')
+        if [ "$LVM" == "true" ]; then
+            HOOKS=$(echo $HOOKS | sed 's/!sd-lvm2/sd-lvm2/')
+        fi
+        if [ -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" ]; then
+            HOOKS=$(echo $HOOKS | sed 's/!sd-encrypt/sd-encrypt/')
+        fi
+    else
+        HOOKS=$(echo $HOOKS | sed 's/!udev/udev/')
+        HOOKS=$(echo $HOOKS | sed 's/!usr/usr/')
+        HOOKS=$(echo $HOOKS | sed 's/!keymap/keymap/')
+        HOOKS=$(echo $HOOKS | sed 's/!consolefont/consolefont/')
+        if [ "$LVM" == "true" ]; then
+            HOOKS=$(echo $HOOKS | sed 's/!lvm2/lvm2/')
+        fi
+        if [ -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" ]; then
+            HOOKS=$(echo $HOOKS | sed 's/!encrypt/encrypt/')
+        fi
+    fi
+    HOOKS=$(sanitize_variable "$HOOKS")
+    arch-chroot /mnt sed -i "s/^HOOKS=(.*)$/HOOKS=($HOOKS)/" /etc/mkinitcpio.conf
 
     if [ "$KERNELS_COMPRESSION" != "" ]; then
-        arch-chroot /mnt sed -i "s/#COMPRESSION=\"$KERNELS_COMPRESSION\"/COMPRESSION=\"$KERNELS_COMPRESSION\"/" /etc/mkinitcpio.conf
+        arch-chroot /mnt sed -i 's/^#COMPRESSION="'"$KERNELS_COMPRESSION"'"/COMPRESSION="'"$KERNELS_COMPRESSION"'"/' /etc/mkinitcpio.conf
     fi
+}
+
+function kernels() {
+    print_step "kernels()"
+
+    pacman_install "linux-headers"
+    if [ -n "$KERNELS" ]; then
+        pacman_install "$KERNELS"
+    fi
+}
+
+function mkinitcpio() {
+    print_step "mkinitcpio()"
 
     arch-chroot /mnt mkinitcpio -P
+}
+
+function network() {
+    print_step "network()"
+
+    pacman_install "networkmanager"
+    arch-chroot /mnt systemctl enable NetworkManager.service
+}
+
+function virtualbox() {
+    print_step "virtualbox()"
+
+    if [ -z "$KERNELS" ]; then
+        pacman_install "virtualbox-guest-utils virtualbox-guest-modules-arch"
+    else
+        pacman_install "virtualbox-guest-utils virtualbox-guest-dkms"
+    fi
 }
 
 function bootloader() {
@@ -576,8 +695,13 @@ function bootloader() {
 
     BOOTLOADER_ALLOW_DISCARDS=""
 
-    if [ "$CPU_INTEL" == "true" -a "$VIRTUALBOX" != "true" ]; then
-        pacman_install "intel-ucode"
+    if [ "$VIRTUALBOX" != "true" ]; then
+        if [ "$CPU_VENDOR" == "intel" ]; then
+            pacman_install "intel-ucode"
+        fi
+        if [ "$CPU_VENDOR" == "amd" ]; then
+            pacman_install "amd-ucode"
+        fi
     fi
     if [ "$LVM" == "true" ]; then
         CMDLINE_LINUX_ROOT="root=$DEVICE_ROOT"
@@ -590,12 +714,19 @@ function bootloader() {
         fi
         CMDLINE_LINUX="cryptdevice=PARTUUID=$PARTUUID_ROOT:$LVM_VOLUME_PHISICAL$BOOTLOADER_ALLOW_DISCARDS"
     fi
+    if [ "$FILE_SYSTEM_TYPE" == "btrfs" ]; then
+        CMDLINE_LINUX="$CMDLINE_LINUX rootflags=subvol=root"
+    fi
     if [ "$KMS" == "true" ]; then
         case "$DISPLAY_DRIVER" in
             "nvidia" | "nvidia-390xx" | "nvidia-390xx-lts" )
                 CMDLINE_LINUX="$CMDLINE_LINUX nvidia-drm.modeset=1"
                 ;;
         esac
+    fi
+
+    if [ -n "$KERNELS_PARAMETERS" ]; then
+        CMDLINE_LINUX="$CMDLINE_LINUX $KERNELS_PARAMETERS"
     fi
 
     case "$BOOTLOADER" in
@@ -609,6 +740,8 @@ function bootloader() {
             systemd
             ;;
     esac
+
+    arch-chroot /mnt systemctl set-default multi-user.target
 }
 
 function grub() {
@@ -616,7 +749,7 @@ function grub() {
     arch-chroot /mnt sed -i 's/GRUB_DEFAULT=0/GRUB_DEFAULT=saved/' /etc/default/grub
     arch-chroot /mnt sed -i 's/#GRUB_SAVEDEFAULT="true"/GRUB_SAVEDEFAULT="true"/' /etc/default/grub
     arch-chroot /mnt sed -i -E 's/GRUB_CMDLINE_LINUX_DEFAULT="(.*) quiet"/GRUB_CMDLINE_LINUX_DEFAULT="\1"/' /etc/default/grub
-    arch-chroot /mnt sed -i 's/GRUB_CMDLINE_LINUX=""/GRUB_CMDLINE_LINUX="'$CMDLINE_LINUX'"/' /etc/default/grub
+    arch-chroot /mnt sed -i 's/GRUB_CMDLINE_LINUX=""/GRUB_CMDLINE_LINUX="'"$CMDLINE_LINUX"'"/' /etc/default/grub
     echo "" >> /mnt/etc/default/grub
     echo "# alis" >> /mnt/etc/default/grub
     echo "GRUB_DISABLE_SUBMENU=y" >> /mnt/etc/default/grub
@@ -649,73 +782,85 @@ function refind() {
 
     REFIND_MICROCODE=""
 
-    if [ "$CPU_INTEL" == "true" -a "$VIRTUALBOX" != "true" ]; then
-        REFIND_MICROCODE="initrd=/intel-ucode.img"
+    if [ "$VIRTUALBOX" != "true" ]; then
+        if [ "$CPU_VENDOR" == "intel" ]; then
+            REFIND_MICROCODE="initrd=/intel-ucode.img"
+        fi
+        if [ "$CPU_VENDOR" == "amd" ]; then
+            REFIND_MICROCODE="initrd=/amd-ucode.img"
+        fi
     fi
 
-    echo "" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "# alis" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "menuentry \"Arch Linux\" {" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "    volume   $PARTUUID_BOOT" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "    loader   /vmlinuz-linux" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "    initrd   /initramfs-linux.img" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "    icon     /EFI/refind/icons/os_arch.png" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "    options  \"$REFIND_MICROCODE $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX\"" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "    submenuentry \"Boot using fallback initramfs\" {" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "	      initrd /initramfs-linux-fallback.img" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "    }" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "    submenuentry \"Boot to terminal\" {" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "	      add_options \"systemd.unit=multi-user.target\"" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "    }" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "}" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-    echo "" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
+    cat <<EOT >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
+# alis
+menuentry "Arch Linux" {
+    volume   $PARTUUID_BOOT
+    loader   /vmlinuz-linux
+    initrd   /initramfs-linux.img
+    icon     /EFI/refind/icons/os_arch.png
+    options  "$REFIND_MICROCODE $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX"
+    submenuentry "Boot using fallback initramfs"
+	      initrd /initramfs-linux-fallback.img"
+    }
+    submenuentry "Boot to terminal"
+	      add_options "systemd.unit=multi-user.target"
+    }
+}"
+
+EOT
     if [[ $KERNELS =~ .*linux-lts.* ]]; then
-        echo "menuentry \"Arch Linux (lts)\" {" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    volume   $PARTUUID_BOOT" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    loader   /vmlinuz-linux-lts" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    initrd   /initramfs-linux-lts.img" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    icon     /EFI/refind/icons/os_arch.png" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    options  \"$REFIND_MICROCODE $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX\"" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    submenuentry \"Boot using fallback initramfs\" {" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "	      initrd /initramfs-linux-lts-fallback.img" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    }" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    submenuentry \"Boot to terminal\" {" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "	      add_options \"systemd.unit=multi-user.target\"" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    }" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "}" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
+        cat <<EOT >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
+menuentry "Arch Linux (lts)" {
+    volume   $PARTUUID_BOOT
+    loader   /vmlinuz-linux-lts
+    initrd   /initramfs-linux-lts.img
+    icon     /EFI/refind/icons/os_arch.png
+    options  "$REFIND_MICROCODE $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX"
+    submenuentry "Boot using fallback initramfs" {
+	      initrd /initramfs-linux-lts-fallback.img
+    }
+    submenuentry "Boot to terminal" {
+	      add_options "systemd.unit=multi-user.target"
+    }
+}
+
+EOT
     fi
     if [[ $KERNELS =~ .*linux-hardened.* ]]; then
-        echo "menuentry \"Arch Linux (hardened)\" {" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    volume   $PARTUUID_BOOT" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    loader   /vmlinuz-linux-hardened" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    initrd   /initramfs-linux-hardened.img" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    icon     /EFI/refind/icons/os_arch.png" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    options  \"$REFIND_MICROCODE $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX\"" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    submenuentry \"Boot using fallback initramfs\" {" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "	      initrd /initramfs-linux-hardened-fallback.img" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    }" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    submenuentry \"Boot to terminal\" {" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "	      add_options \"systemd.unit=multi-user.target\"" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    }" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "}" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
+        cat <<EOT >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
+menuentry "Arch Linux (hardened)" {
+    volume   $PARTUUID_BOOT
+    loader   /vmlinuz-linux-hardened
+    initrd   /initramfs-linux-hardened.img
+    icon     /EFI/refind/icons/os_arch.png
+    options  "$REFIND_MICROCODE $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX"
+    submenuentry "Boot using fallback initramfs" {
+	      initrd /initramfs-linux-lts-fallback.img
+    }
+    submenuentry "Boot to terminal" {
+	      add_options "systemd.unit=multi-user.target"
+    }
+}
+
+EOT
     fi
     if [[ $KERNELS =~ .*linux-zen.* ]]; then
-        echo "menuentry \"Arch Linux (zen)\" {" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    volume   $PARTUUID_BOOT" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    loader   /vmlinuz-linux-zen" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    initrd   /initramfs-linux-zen.img" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    icon     /EFI/refind/icons/os_arch.png" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    options  \"$REFIND_MICROCODE $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX\"" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    submenuentry \"Boot using fallback initramfs\" {" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "	      initrd /initramfs-linux-zen-fallback.img" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    }" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    submenuentry \"Boot to terminal\" {" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "	      add_options \"systemd.unit=multi-user.target\"" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "    }" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "}" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
-        echo "" >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
+        cat <<EOT >> "/mnt$ESP_DIRECTORY/EFI/refind/refind.conf"
+menuentry "Arch Linux (zen)" {
+    volume   $PARTUUID_BOOT
+    loader   /vmlinuz-linux-zen
+    initrd   /initramfs-linux-zen.img
+    icon     /EFI/refind/icons/os_arch.png
+    options  "$REFIND_MICROCODE $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX"
+    submenuentry "Boot using fallback initramfs" {
+	      initrd /initramfs-linux-lts-fallback.img
+    }
+    submenuentry "Boot to terminal" {
+	      add_options "systemd.unit=multi-user.target"
+    }
+}
+
+EOT
     fi
 
     if [ "$VIRTUALBOX" == "true" ]; then
@@ -724,37 +869,51 @@ function refind() {
 }
 
 function systemd() {
+    arch-chroot /mnt systemd-machine-id-setup
     arch-chroot /mnt bootctl --path="$ESP_DIRECTORY" install
 
     arch-chroot /mnt mkdir -p "$ESP_DIRECTORY/loader/"
     arch-chroot /mnt mkdir -p "$ESP_DIRECTORY/loader/entries/"
 
-    echo "# alis" > "/mnt$ESP_DIRECTORY/loader/loader.conf"
-    echo "timeout 5" >> "/mnt$ESP_DIRECTORY/loader/loader.conf"
-    echo "default archlinux" >> "/mnt$ESP_DIRECTORY/loader/loader.conf"
-    echo "editor 0" >> "/mnt$ESP_DIRECTORY/loader/loader.conf"
+    cat <<EOT > "/mnt$ESP_DIRECTORY/loader/loader.conf"
+# alis
+timeout 5
+default archlinux
+editor 0
+EOT
 
     arch-chroot /mnt mkdir -p "/etc/pacman.d/hooks/"
 
-    echo "[Trigger]" >> /mnt/etc/pacman.d/hooks/systemd-boot.hook
-    echo "Type = Package" >> /mnt/etc/pacman.d/hooks/systemd-boot.hook
-    echo "Operation = Upgrade" >> /mnt/etc/pacman.d/hooks/systemd-boot.hook
-    echo "Target = systemd" >> /mnt/etc/pacman.d/hooks/systemd-boot.hook
-    echo "" >> /mnt/etc/pacman.d/hooks/systemd-boot.hook
-    echo "[Action]" >> /mnt/etc/pacman.d/hooks/systemd-boot.hook
-    echo "Description = Updating systemd-boot..." >> /mnt/etc/pacman.d/hooks/systemd-boot.hook
-    echo "When = PostTransaction" >> /mnt/etc/pacman.d/hooks/systemd-boot.hook
-    echo "Exec = /usr/bin/bootctl update" >> /mnt/etc/pacman.d/hooks/systemd-boot.hook
+    cat <<EOT > "/mnt/etc/pacman.d/hooks/systemd-boot.hook"
+[Trigger]
+Type = Package
+Operation = Upgrade
+Target = systemd
+
+[Action]
+Description = Updating systemd-boot
+When = PostTransaction
+Exec = /usr/bin/bootctl update
+EOT
 
     SYSTEMD_MICROCODE=""
     SYSTEMD_OPTIONS=""
 
-    if [ "$CPU_INTEL" == "true" -a "$VIRTUALBOX" != "true" ]; then
-        SYSTEMD_MICROCODE="/intel-ucode.img"
+    if [ "$VIRTUALBOX" != "true" ]; then
+        if [ "$CPU_VENDOR" == "intel" ]; then
+            SYSTEMD_MICROCODE="/intel-ucode.img"
+        fi
+        if [ "$CPU_VENDOR" == "amd" ]; then
+            SYSTEMD_MICROCODE="/amd-ucode.img"
+        fi
     fi
 
     if [ -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" ]; then
        SYSTEMD_OPTIONS="rd.luks.options=discard"
+
+        cat <<EOT > "/mnt/etc/crypttab.initramfs"
+lvm $PARTITION_ROOT
+EOT
     fi
 
     echo "title Arch Linux" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux.conf"
@@ -764,6 +923,14 @@ function systemd() {
     fi
     echo "initrd /initramfs-linux.img" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux.conf"
     echo "options initrd=initramfs-linux.img $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX $SYSTEMD_OPTIONS" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux.conf"
+
+    echo "title Arch Linux (terminal)" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-terminal.conf"
+    echo "efi /vmlinuz-linux" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-terminal.conf"
+    if [ -n "$SYSTEMD_MICROCODE" ]; then
+        echo "initrd $SYSTEMD_MICROCODE" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-terminal.conf"
+    fi
+    echo "initrd /initramfs-linux.img" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-terminal.conf"
+    echo "options initrd=initramfs-linux.img $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX systemd.unit=multi-user.target $SYSTEMD_OPTIONS" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-terminal.conf"
 
     echo "title Arch Linux (fallback)" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-fallback.conf"
     echo "efi /vmlinuz-linux" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-fallback.conf"
@@ -777,10 +944,18 @@ function systemd() {
         echo "title Arch Linux (lts)" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-lts.conf"
         echo "efi /vmlinuz-linux-lts" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-lts.conf"
         if [ -n "$SYSTEMD_MICROCODE" ]; then
-            echo "initrd $SYSTEMD_MICROCODE" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux.conf"
+            echo "initrd $SYSTEMD_MICROCODE" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-lts.conf"
         fi
         echo "initrd /initramfs-linux-lts.img" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-lts.conf"
         echo "options initrd=initramfs-linux-lts.img $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX $SYSTEMD_OPTIONS" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-lts.conf"
+
+        echo "title Arch Linux (lts, terminal)" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-lts-terminal.conf"
+        echo "efi /vmlinuz-linux-lts" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-lts-terminal.conf"
+        if [ -n "$SYSTEMD_MICROCODE" ]; then
+            echo "initrd $SYSTEMD_MICROCODE" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-lts-terminal.conf"
+        fi
+        echo "initrd /initramfs-linux-lts.img" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-lts-terminal.conf"
+        echo "options initrd=initramfs-linux-lts.img $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX systemd.unit=multi-user.target $SYSTEMD_OPTIONS" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-lts-terminal.conf"
 
         echo "title Arch Linux (lts-fallback)" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-lts-fallback.conf"
         echo "efi /vmlinuz-linux-lts" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-lts-fallback.conf"
@@ -795,10 +970,18 @@ function systemd() {
         echo "title Arch Linux (hardened)" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-hardened.conf"
         echo "efi /vmlinuz-linux-hardened" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-hardened.conf"
         if [ -n "$SYSTEMD_MICROCODE" ]; then
-            echo "initrd $SYSTEMD_MICROCODE" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux.conf"
+            echo "initrd $SYSTEMD_MICROCODE" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-hardened.conf"
         fi
         echo "initrd /initramfs-linux-hardened.img" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-hardened.conf"
         echo "options initrd=initramfs-linux-hardened.img $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX $SYSTEMD_OPTIONS" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-hardened.conf"
+
+        echo "title Arch Linux (hardened, terminal)" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-hardened-terminal.conf"
+        echo "efi /vmlinuz-linux-hardened" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-hardened-terminal.conf"
+        if [ -n "$SYSTEMD_MICROCODE" ]; then
+            echo "initrd $SYSTEMD_MICROCODE" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-hardened-terminal.conf"
+        fi
+        echo "initrd /initramfs-linux-hardened.img" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-hardened-terminal.conf"
+        echo "options initrd=initramfs-linux-hardened.img $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX systemd.unit=multi-user.target $SYSTEMD_OPTIONS" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-hardened-terminal.conf"
 
         echo "title Arch Linux (hardened-fallback)" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-hardened-fallback.conf"
         echo "efi /vmlinuz-linux-hardened" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-hardened-fallback.conf"
@@ -813,10 +996,18 @@ function systemd() {
         echo "title Arch Linux (zen)" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-zen.conf"
         echo "efi /vmlinuz-linux-zen" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-zen.conf"
         if [ -n "$SYSTEMD_MICROCODE" ]; then
-            echo "initrd $SYSTEMD_MICROCODE" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux.conf"
+            echo "initrd $SYSTEMD_MICROCODE" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-zen.conf"
         fi
         echo "initrd /initramfs-linux-zen.img" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-zen.conf"
         echo "options initrd=initramfs-linux-zen.img $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX $SYSTEMD_OPTIONS" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-zen.conf"
+
+        echo "title Arch Linux (zen, terminal)" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-zen-terminal.conf"
+        echo "efi /vmlinuz-linux-zen" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-zen-terminal.conf"
+        if [ -n "$SYSTEMD_MICROCODE" ]; then
+            echo "initrd $SYSTEMD_MICROCODE" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-zen-terminal.conf"
+        fi
+        echo "initrd /initramfs-linux-zen.img" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-zen-terminal.conf"
+        echo "options initrd=initramfs-linux-zen.img $CMDLINE_LINUX_ROOT rw $CMDLINE_LINUX systemd.unit=multi-user.target $SYSTEMD_OPTIONS" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-zen-terminal.conf"
 
         echo "title Arch Linux (zen-fallback)" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-zen-fallback.conf"
         echo "efi /vmlinuz-linux-zen" >> "/mnt$ESP_DIRECTORY/loader/entries/archlinux-zen-fallback.conf"
@@ -833,18 +1024,21 @@ function systemd() {
 }
 
 function users() {
+    print_step "users()"
+
     create_user $USER_NAME $USER_PASSWORD
 
-    for i in ${!ADDITIONAL_USER_NAMES_ARRAY[@]}; do
-        create_user ${ADDITIONAL_USER_NAMES_ARRAY[$i]} ${ADDITIONAL_USER_PASSWORDS_ARRAY[$i]}
+    for U in ${ADDITIONAL_USERS[@]}; do
+        IFS='=' S=(${U})
+        USER=${S[0]}
+        PASSWORD=${S[1]}
+        create_user "${USER}" "${PASSWORD}"
     done
 
 	arch-chroot /mnt sed -i 's/# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers
 }
 
 function create_user() {
-    print_step "create_user()"
-
     USER_NAME=$1
     USER_PASSWORD=$2
     arch-chroot /mnt useradd -m -G wheel,storage,optical -s /bin/bash $USER_NAME
@@ -953,6 +1147,8 @@ function desktop_environment() {
             desktop_environment_lxde
             ;;
     esac
+
+    arch-chroot /mnt systemctl set-default graphical.target
 }
 
 function desktop_environment_gnome() {
@@ -996,22 +1192,21 @@ function desktop_environment_lxde() {
 function packages() {
     print_step "packages()"
 
-    if [ "$FILE_SYSTEM_TYPE" == "btrfs" ]; then
-        pacman_install "btrfs-progs"
-    fi
-
     if [ -n "$PACKAGES_PACMAN" ]; then
         pacman_install "$PACKAGES_PACMAN"
     fi
 
-    packages_aur
+    if [ -n "$AUR" -o -n "$PACKAGES_AUR" ]; then
+        packages_aur
+    fi
 }
 
 function packages_aur() {
+    arch-chroot /mnt sed -i 's/%wheel ALL=(ALL) ALL/%wheel ALL=(ALL) NOPASSWD: ALL/' /etc/sudoers
+
     if [ -n "$AUR" -o -n "$PACKAGES_AUR" ]; then
         pacman_install "git"
 
-        arch-chroot /mnt sed -i 's/%wheel ALL=(ALL) ALL/%wheel ALL=(ALL) NOPASSWD: ALL/' /etc/sudoers
         case "$AUR" in
             "aurman" )
                 arch-chroot /mnt bash -c "echo -e \"$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n\" | su $USER_NAME -c \"cd /home/$USER_NAME && git clone https://aur.archlinux.org/$AUR.git && gpg --recv-key 465022E743D71E39 && (cd $AUR && makepkg -si --noconfirm) && rm -rf $AUR\""
@@ -1020,12 +1215,13 @@ function packages_aur() {
                 arch-chroot /mnt bash -c "echo -e \"$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n$USER_PASSWORD\n\" | su $USER_NAME -c \"cd /home/$USER_NAME && git clone https://aur.archlinux.org/$AUR.git && (cd $AUR && makepkg -si --noconfirm) && rm -rf $AUR\""
                 ;;
         esac
-        arch-chroot /mnt sed -i 's/%wheel ALL=(ALL) NOPASSWD: ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers
     fi
 
     if [ -n "$PACKAGES_AUR" ]; then
         aur_install "$PACKAGES_AUR"
     fi
+
+    arch-chroot /mnt sed -i 's/%wheel ALL=(ALL) NOPASSWD: ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers
 }
 
 function terminate() {
@@ -1132,13 +1328,14 @@ function main() {
     prepare
     partition
     install
-    kernels
     configuration
+    mkinitcpio_configuration
+    kernels
+    mkinitcpio
     network
     if [ "$VIRTUALBOX" == "true" ]; then
         virtualbox
     fi
-    mkinitcpio
     bootloader
     if [ "$DESKTOP_ENVIRONMENT" != "" ]; then
         desktop_environment

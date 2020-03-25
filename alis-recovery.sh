@@ -39,7 +39,7 @@ set -e
 
 # Usage:
 # # loadkeys es
-# # curl https://raw.githubusercontent.com/lkrms/alis/master/download.sh | bash
+# # curl -L https://lkr.ms/alis | bash
 # # vim alis-recovery.conf
 # # ./alis-recovery.sh
 
@@ -63,7 +63,7 @@ PARTUUID_ROOT=""
 DEVICE_SATA=""
 DEVICE_NVME=""
 DEVICE_MMC=""
-CPU_INTEL=""
+CPU_VENDOR=""
 VIRTUALBOX=""
 CMDLINE_LINUX_ROOT=""
 CMDLINE_LINUX=""
@@ -97,6 +97,13 @@ function check_variables() {
     check_variables_value "DEVICE" "$DEVICE"
     check_variables_boolean "LVM" "$LVM"
     check_variables_equals "PARTITION_ROOT_ENCRYPTION_PASSWORD" "PARTITION_ROOT_ENCRYPTION_PASSWORD_RETYPE" "$PARTITION_ROOT_ENCRYPTION_PASSWORD" "$PARTITION_ROOT_ENCRYPTION_PASSWORD_RETYPE"
+    check_variables_list "PARTITION_MODE" "$PARTITION_MODE" "auto custom manual" "true"
+    check_variables_value "PARTITION_BIOS" "$PARTITION_BIOS"
+    check_variables_value "PARTITION_BOOT" "$PARTITION_BOOT"
+    check_variables_value "PARTITION_ROOT" "$PARTITION_ROOT"
+    if [ "$LVM" == "true" ]; then
+        check_variables_list "PARTITION_MODE" "$PARTITION_MODE" "auto" "true"
+    fi
     check_variables_value "PING_HOSTNAME" "$PING_HOSTNAME"
 }
 
@@ -207,6 +214,7 @@ function facts() {
 
 function prepare() {
     prepare_partition
+    configure_network
 }
 
 function prepare_partition() {
@@ -229,21 +237,21 @@ function prepare_partition() {
 function configure_network() {
     if [ -n "$WIFI_INTERFACE" ]; then
         cp /etc/netctl/examples/wireless-wpa /etc/netctl
-      	chmod 600 /etc/netctl
+          chmod 600 /etc/netctl
 
-      	sed -i 's/^Interface=.*/Interface='"$WIFI_INTERFACE"'/' /etc/netctl
-      	sed -i 's/^ESSID=.*/ESSID='"$WIFI_ESSID"'/' /etc/netctl
-      	sed -i 's/^Key=.*/Key='\''$WIFI_KEY'\''/' /etc/netctl
-      	if [ "$WIFI_HIDDEN" == "true" ]; then
-      		sed -i 's/^#Hidden=.*/Hidden=yes/' /etc/netctl
-      	fi
+          sed -i 's/^Interface=.*/Interface='"$WIFI_INTERFACE"'/' /etc/netctl
+          sed -i 's/^ESSID=.*/ESSID='"$WIFI_ESSID"'/' /etc/netctl
+          sed -i 's/^Key=.*/Key='\''$WIFI_KEY'\''/' /etc/netctl
+          if [ "$WIFI_HIDDEN" == "true" ]; then
+              sed -i 's/^#Hidden=.*/Hidden=yes/' /etc/netctl
+          fi
 
         netctl stop-all
         netctl start wireless-wpa
         sleep 10
     fi
 
-    ping -c 5 $PING_HOSTNAME
+    ping -c 1 -i 2 -W 5 -w 30 $PING_HOSTNAME
     if [ $? -ne 0 ]; then
         echo "Network ping check failed. Cannot continue."
         exit
@@ -251,55 +259,59 @@ function configure_network() {
 }
 
 function partition() {
-    if [ "$BIOS_TYPE" == "uefi" ]; then
-        if [ "$DEVICE_SATA" == "true" ]; then
-            PARTITION_BOOT="${DEVICE}1"
-            PARTITION_ROOT="${DEVICE}2"
-            #PARTITION_BOOT_NUMBER=1
-            DEVICE_ROOT="${DEVICE}2"
-        fi
-        
-        if [ "$DEVICE_NVME" == "true" ]; then
-            PARTITION_BOOT="${DEVICE}p1"
-            PARTITION_ROOT="${DEVICE}p2"
-            #PARTITION_BOOT_NUMBER=1
-            DEVICE_ROOT="${DEVICE}p2"
+    # setup
+    if [ "$PARTITION_MODE" == "auto" ]; then
+        if [ "$BIOS_TYPE" == "uefi" ]; then
+            if [ "$DEVICE_SATA" == "true" ]; then
+                PARTITION_BOOT="${DEVICE}1"
+                PARTITION_ROOT="${DEVICE}2"
+                #PARTITION_BOOT_NUMBER=1
+                DEVICE_ROOT="${DEVICE}2"
+            fi
+
+            if [ "$DEVICE_NVME" == "true" ]; then
+                PARTITION_BOOT="${DEVICE}p1"
+                PARTITION_ROOT="${DEVICE}p2"
+                #PARTITION_BOOT_NUMBER=1
+                DEVICE_ROOT="${DEVICE}p2"
+            fi
+
+            if [ "$DEVICE_MMC" == "true" ]; then
+                PARTITION_BOOT="${DEVICE}p1"
+                PARTITION_ROOT="${DEVICE}p2"
+                #PARTITION_BOOT_NUMBER=1
+                DEVICE_ROOT="${DEVICE}p2"
+            fi
         fi
 
-        if [ "$DEVICE_MMC" == "true" ]; then
-            PARTITION_BOOT="${DEVICE}p1"
-            PARTITION_ROOT="${DEVICE}p2"
-            #PARTITION_BOOT_NUMBER=1
-            DEVICE_ROOT="${DEVICE}p2"
+        if [ "$BIOS_TYPE" == "bios" ]; then
+            if [ "$DEVICE_SATA" == "true" ]; then
+                PARTITION_BIOS="${DEVICE}1"
+                PARTITION_BOOT="${DEVICE}2"
+                PARTITION_ROOT="${DEVICE}3"
+                #PARTITION_BOOT_NUMBER=2
+                DEVICE_ROOT="${DEVICE}3"
+            fi
+
+            if [ "$DEVICE_NVME" == "true" ]; then
+                PARTITION_BIOS="${DEVICE}p1"
+                PARTITION_BOOT="${DEVICE}p2"
+                PARTITION_ROOT="${DEVICE}p3"
+                #PARTITION_BOOT_NUMBER=2
+                DEVICE_ROOT="${DEVICE}p3"
+            fi
+
+            if [ "$DEVICE_MMC" == "true" ]; then
+                PARTITION_BIOS="${DEVICE}p1"
+                PARTITION_BOOT="${DEVICE}p2"
+                PARTITION_ROOT="${DEVICE}p3"
+                #PARTITION_BOOT_NUMBER=2
+                DEVICE_ROOT="${DEVICE}p3"
+            fi
         fi
     fi
 
-    if [ "$BIOS_TYPE" == "bios" ]; then
-        if [ "$DEVICE_SATA" == "true" ]; then
-            PARTITION_BIOS="${DEVICE}1"
-            PARTITION_BOOT="${DEVICE}2"
-            PARTITION_ROOT="${DEVICE}3"
-            #PARTITION_BOOT_NUMBER=2
-            DEVICE_ROOT="${DEVICE}3"
-        fi
-        
-        if [ "$DEVICE_NVME" == "true" ]; then
-            PARTITION_BIOS="${DEVICE}p1"
-            PARTITION_BOOT="${DEVICE}p2"
-            PARTITION_ROOT="${DEVICE}p3"
-            #PARTITION_BOOT_NUMBER=2
-            DEVICE_ROOT="${DEVICE}p3"
-        fi
-
-        if [ "$DEVICE_MMC" == "true" ]; then
-            PARTITION_BIOS="${DEVICE}p1"
-            PARTITION_BOOT="${DEVICE}p2"
-            PARTITION_ROOT="${DEVICE}p3"
-            #PARTITION_BOOT_NUMBER=2
-            DEVICE_ROOT="${DEVICE}p3"
-        fi
-    fi
-
+    # luks and lvm
     if [ -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" ]; then
         echo -n "$PARTITION_ROOT_ENCRYPTION_PASSWORD" | cryptsetup --key-file=- open $PARTITION_ROOT $LVM_VOLUME_PHISICAL
         sleep 5
@@ -310,14 +322,23 @@ function partition() {
         DEVICE_ROOT="/dev/mapper/$DEVICE_ROOT_MAPPER"
     fi
 
-    PARTITION_OPTIONS=""
+    PARTITION_OPTIONS="defaults"
 
     if [ "$DEVICE_TRIM" == "true" ]; then
-        PARTITION_OPTIONS="defaults,noatime"
+        PARTITION_OPTIONS="$PARTITION_OPTIONS,noatime"
     fi
 
-    mount -o "$PARTITION_OPTIONS" $DEVICE_ROOT /mnt
-    mount -o "$PARTITION_OPTIONS" $PARTITION_BOOT /mnt/boot
+    # mount
+    if [ "$FILE_SYSTEM_TYPE" == "btrfs" ]; then
+        mount -o "subvol=root,$PARTITION_OPTIONS,compress=lzo" "$DEVICE_ROOT" /mnt
+        mount -o "$PARTITION_OPTIONS" "$PARTITION_BOOT" /mnt/boot
+        mount -o "subvol=home,$PARTITION_OPTIONS,compress=lzo" "$DEVICE_ROOT" /mnt/home
+        mount -o "subvol=var,$PARTITION_OPTIONS,compress=lzo" "$DEVICE_ROOT" /mnt/var
+        mount -o "subvol=snapshots,$PARTITION_OPTIONS,compress=lzo" "$DEVICE_ROOT" /mnt/snapshots
+    else
+        mount -o "$PARTITION_OPTIONS" $DEVICE_ROOT /mnt
+        mount -o "$PARTITION_OPTIONS" $PARTITION_BOOT /mnt/boot
+    fi
 }
 
 function recovery() {
