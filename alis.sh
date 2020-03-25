@@ -1162,7 +1162,7 @@ function desktop_environment_kde() {
 }
 
 function desktop_environment_xfce() {
-    pacman_install "xfce4 $(arch-chroot /mnt pacman -Sygq xfce4-goodies | grep -Fxv "xfce4-screensaver" | xargs) lightdm lightdm-gtk-greeter xorg-server xsecurelock xss-lock"
+    pacman_install "xfce4 $(arch-chroot /mnt pacman -Sgq xfce4-goodies | grep -Fxv "xfce4-screensaver" | xargs) lightdm lightdm-gtk-greeter xorg-server xsecurelock xss-lock"
     mkdir -p /mnt/etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml &&
         echo '<?xml version="1.0" encoding="UTF-8"?>
 
